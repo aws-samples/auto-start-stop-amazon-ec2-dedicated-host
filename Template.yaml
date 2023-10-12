@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Automate the allocation and de-allocation of AWS dedicated hosts using AWS Lambda, Boto3, and Amazon EventBridge to save cost
+Parameters:
+  availabilityzone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: "Enter a valid Availability Zone, such as ap-south-1a or ap-south-1b"
+  instancetype:
+    Type: String
+    Description: "specify any instance type that supports dedicated host in the above specified region/az "
+    Default: "m6g.xlarge"
+  hostname:
+    Type: String
+    Description: "specify a host name which will be assigned to the dedicated host, the default value is set to Dedicated-Host-workspaces"
+    Default: Dedicated-Host-workspaces
+  instanceids:
+    Type: List<AWS::EC2::Instance::Id>
+    Description: "An array of Amazon EC2 instance IDs, such as i-123456789012, i-234567890121 comma separated values"
+  wakeupcron:
+    Type: String
+    Description: "specify the cron expression which triggers start all functionality, default is at 9 30 AM - cron(30 9 * * ? *)"
+    Default: "cron(30 9 * * ? *)"
+  stopallcron:
+    Type: String
+    Description: "specify the cron expression which triggers stop all functionality , default is at 9 PM - cron(0 21 * * ? *)"
+    Default: "cron(0 21 * * ? *)"
+  emailforalert:
+    Type: String
+    Description: "specify an email address that will receive an alert incase of an failure"
+    AllowedPattern: "^[\\x20-\\x45]?[\\w-\\+]+(\\.[\\w]+)*@[\\w-]+(\\.[\\w]+)*(\\.[a-z]{2,})$"
+    ConstraintDescription: "must be a valid email address"
+
+
+
+Resources:
+  AutomationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: customer-policy-dh-automation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: DHLambdaAccess
+                Effect: Allow
+                Action:
+                  -  "ec2:DescribeHosts"
+                  -  "logs:CreateLogStream"
+                  -  "ec2:DeleteTags"
+                  -  "ec2:CreateTags"
+                  -  "ec2:ModifyInstancePlacement"
+                  -  "sns:Publish"
+                  -  "ec2:AllocateHosts"
+                  -  "logs:CreateLogGroup"
+                  -  "logs:PutLogEvents"
+                  -  "ec2:ReleaseHosts"
+                  -  "ec2:DescribeInstanceStatus"
+                  -  "ec2:StartInstances"
+                  -  "ec2:StopInstances"
+                Resource: '*'
+
+
+  SnsTopicForAlert:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint:
+            Ref: emailforalert
+          Protocol: email
+
+  AutomationLambda:
+    Type: AWS::Lambda::Function
+    #checkov:skip=CKV_AWS_173:By default Lambda uses an AWS KMS key that Lambda creates in your account to encrypt your environment variables
+    #checkov:skip=CKV_AWS_115:Concurrancy is not required at this level for this function
+    #checkov:skip=CKV_AWS_117:VPC is not required for this lambda function
+    #checkov:skip=CKV_AWS_116:Dead Letter queue is not configured for this lambda function as it doesn't have any asynchronous invocations
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda function is not owned by VPC.
+          - id: W92
+            reason: reserve simultaneous executions is not required for this function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import boto3
+          import os
+
+          # VARIABLES
+          az = os.environ['AVAILABILITY_ZONE']
+          InstanceType = os.environ['INSTANCE_TYPE']
+          instance_ids = os.environ['INSTANCE_IDS'].split(",")
+          host_name = os.environ['HOST_NAME']
+          sns_arn = os.environ['SNS_ARN']
+          client = boto3.client('ec2')
+          snsclient = boto3.client('sns')
+
+
+          def lambda_handler(event, context):
+              try: 
+                print(event)
+                if event['trigger'] == 'rise':
+                    fun_morning_call()
+                if event['trigger'] == 'set':
+                    fun_evening_call()
+              except Exception as e:
+                print(e)
+                snsclient.publish(
+                  TargetArn=sns_arn,
+                  Subject=f'Execution error in Dedicated Host Automation Lambda',
+                  Message=str(e)
+                  )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!'),
+              }
+
+
+          def fun_morning_call():
+              # create dedicated host
+              host_id = func_create_dedicated_host()
+
+              for instance in instance_ids:
+                  fun_modify_instance(host_id=host_id, instance_id=instance)
+
+              # restart instances
+              fun_restart_instance()
+
+
+          def fun_evening_call():
+              # stop instances
+              fun_stop_instances()
+              func_describe_and_deallocate_host()
+
+
+          def fun_stop_instances():
+              response = client.stop_instances(
+                  InstanceIds=instance_ids)
+              for each in instance_ids:
+                  while True:
+                      response = client.describe_instance_status(
+                          InstanceIds=[
+                              each,
+                          ],
+                          IncludeAllInstances=True
+                      )
+                      ec2_state = response['InstanceStatuses'][0]['InstanceState']['Name']
+                      if ec2_state == 'stopped':
+                          break
+                      print("sleep for 10 secs")
+                      time.sleep(10)
+
+
+          def func_create_dedicated_host():
+              response = client.allocate_hosts(
+                  AvailabilityZone=az,
+                  InstanceType=InstanceType,
+                  # InstanceFamily='m6a',
+                  Quantity=1,
+                  TagSpecifications=[
+                      {
+                          'ResourceType': 'dedicated-host',
+                          'Tags': [
+                              {
+                                  'Key': 'Name',
+                                  'Value': host_name
+                              },
+                          ]
+                      },
+                  ],
+                  HostMaintenance='on')
+              print(response)
+              return response['HostIds'][0]
+
+
+          def fun_modify_instance(host_id, instance_id):
+              response = client.modify_instance_placement(
+                  Affinity='host',
+                  HostId=host_id,
+                  InstanceId=instance_id,
+                  Tenancy='host'
+              )
+              print(response)
+
+
+          def fun_restart_instance():
+              response = client.start_instances(
+                  InstanceIds=instance_ids
+              )
+              print(response)
+
+
+          def func_find_host():
+              host_id = ''
+              response_all = client.describe_hosts(Filters=[
+                  {
+                      'Name': 'state',
+                      'Values': [
+                          'available',
+                      ]
+                  }])['Hosts']
+              for hosts in response_all:
+                  tags = hosts['Tags']
+                  for each in tags:
+                      if each['Key'] == 'Name' and each['Value'] == host_name:
+                          host_id = hosts['HostId']
+                          return host_id
+
+
+          def func_describe_and_deallocate_host():
+              host_id = func_find_host()
+              response = client.release_hosts(
+                  HostIds=[
+                      host_id,
+                  ]
+              )
+              print("host release resp", response)
+
+      Description: Automation Lambda which allocated and de-allocates dedicated host
+      FunctionName: dedicated-host-automation
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt AutomationLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 900
+      Environment:
+        Variables:
+          INSTANCE_TYPE :
+            Ref: instancetype
+          AVAILABILITY_ZONE :
+            Ref: availabilityzone
+          HOST_NAME:
+            Ref: hostname
+          INSTANCE_IDS:
+            Fn::Join: [ ',' , !Ref instanceids ]
+          SNS_ARN: !Ref SnsTopicForAlert
+
+  EventRuleRise:
+    Type: AWS::Events::Rule
+    Properties:
+      Description:  Eventbridge rule to Trigger Lambda at 9 30 AM UTC
+      Name: EventRuleRise
+      ScheduleExpression: !Ref wakeupcron
+      State: ENABLED
+      EventPattern:
+        account:
+          - ${aws:accountId}
+      Targets:
+        - Arn:
+            !GetAtt AutomationLambda.Arn
+          Id: MyLambdaTargetRise
+          Input: |-
+            {
+              "trigger": "rise"
+            }
+
+  EventRuleSet:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Eventbridge rule to Trigger Lambda at 9 PM
+      Name: EventRuleSet
+      ScheduleExpression: !Ref stopallcron
+      State: ENABLED
+      EventPattern:
+        account:
+          - ${aws:accountId}
+      Targets:
+        - Arn:
+            !GetAtt AutomationLambda.Arn
+          Id: MyLambdaTargetSet
+          Input: |-
+            {
+              "trigger": "set"
+            }
+
+  EventBridgePermissionSet:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AutomationLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventRuleSet.Arn
+
+  EventBridgePermissionRise:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AutomationLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventRuleRise.Arn
+
+
+
