@@ -30,6 +30,6 @@ Automation is achieved using AWS Lambda, SDK for Python (Boto3), and Amazon Even
 
 ## How it works 
     
-![](SolutionArchDiagram.png)  
+![](SolutionDiagram.png)  
 
     
